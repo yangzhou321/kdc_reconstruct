@@ -1,0 +1,168 @@
+---
+alwaysApply: true
+---
+Project Structure Guidelines for Kuavo Robot Imitation Learning Pipeline
+
+Version 1.0 - End-to-End Rosbag-to-Policy Architecture
+
+1. Executive Summary
+
+This document outlines the required project directory structure for the "Kuavo Data Challenge" codebase. The primary goal is to provide a robust, end-to-end imitation learning pipeline that ingests ROS bag data, converts it into LeRobot-compatible datasets, trains Diffusion/ACT policies, and deploys them onto Simulated or Real Kuavo Humanoid Robots.
+
+Key Architectural Philosophy: The project enforces a strict separation of concerns between Data Engineering (kuavo_data), Policy Training (kuavo_train), and Deployment/Inference (kuavo_deploy). It utilizes a "Patch-First" strategy (lerobot_patches) to extend the LeRobot framework for RGB-D (Depth) support without forking the core library.
+
+2. Top-Level Project Directory: kuavo_data_challenge/
+
+This is the root directory for the entire project.
+
+setup.py: [CRITICAL] Python package configuration defining the package name (kuavo_data_challenge) and version.
+
+requirements_ilcode.txt: Lightweight dependencies for policy training (PyTorch, LeRobot, Hydra) excluding ROS dependencies.
+
+requirements_total.txt: Full dependencies including ROS Noetic libraries for data processing and deployment.
+
+Dockerfile: Defines the reproducible environment for containerized training and evaluation.
+
+docker/: Helper scripts for GPU-accelerated Docker execution.
+
+README.md / README_ZH.md: Project documentation entry points.
+
+configs/: [CENTRAL CONFIGURATION] The single source of truth for all hyperparameters.
+
+data/: Configuration for Rosbag -> LeRobot conversion (camera selection, joint lists).
+
+policy/: Hyperparameters for ACT and Diffusion policies.
+
+deploy/: Environment configurations (kuavo_real_env.yaml, kuavo_sim_env.yaml) defining hardware limits and sensor inputs.
+
+3. Core Application Modules
+
+The source code is divided into four distinct modules to ensure modularity.
+
+3.1 Data Engineering: kuavo_data/
+
+Responsibility: Ingesting raw ROS bags and producing standardized Parquet datasets.
+
+CvtRosbag2Lerobot.py: [ENTRY POINT] The Hydra-configured script that orchestrates the conversion process.
+
+common/:
+
+kuavo_dataset.py: Contains KuavoRosbagReader (aligns timestamps) and KuavoMsgProcesser (extracts data from ROS messages).
+
+ros_handler.py: specialized multiprocessing-safe ROS message handler.
+
+key_listener.py: Utilities for capturing human intervention during data recording/replay.
+
+config_dataset.py: Validation logic for dataset parameters.
+
+3.2 Policy Training: kuavo_train/
+
+Responsibility: Training neural network policies using the LeRobot framework.
+
+train_policy.py: [ENTRY POINT] The main training loop. It hydrates the model, optimizer, and datasets based on YAML configs.
+
+wrapper/: [ADAPTER PATTERN]
+
+dataset/LeRobotDatasetWrapper.py: Extends standard datasets to handle multi-modal (RGB + Depth) synchronization.
+
+policy/diffusion/: Custom wrappers (DiffusionPolicyWrapper, DiffusionModelWrapper) to inject specific Kuavo robot logic into standard Diffusion models.
+
+utils/:
+
+augmenter.py: Custom data augmentation pipelines (e.g., DeterministicAugmenterGeo4Rgbds) specifically designed for 4-channel (RGBD) or 5-channel data.
+
+transforms.py: Torchvision-based image transformations.
+
+3.3 Deployment & Inference: kuavo_deploy/
+
+Responsibility: Running trained policies on hardware or simulation via a Gymnasium interface.
+
+eval_others.py / examples/eval/eval_kuavo.py: [ENTRY POINT] Scripts to load a checkpoint and run the evaluation loop.
+
+kuavo_env/:
+
+KuavoBaseRosEnv.py: The abstract base class implementing the gym.Env interface. Handles the "Bridge" between Policy Actions and ROS Topics.
+
+kuavo_real_env/: Implementation for physical hardware (safety limits, real sensor streams).
+
+kuavo_sim_env/: Implementation for simulation (Isaac Sim/Gazebo bridges).
+
+utils/logging_utils.py: Structured logging for runtime analysis.
+
+3.4 Framework Extensions: lerobot_patches/
+
+Responsibility: Runtime patching of third-party libraries.
+
+custom_patches.py: [CRITICAL] This module must be imported before LeRobot components. It monkey-patches lerobot to support:
+
+FeatureType.DEPTH
+
+Custom statistics computation for depth channels.
+
+Multi-modal data normalization strategies.
+
+4. Architecture Design Principles
+
+4.1 The "Gym-ROS Bridge" Pattern
+
+Decoupling: The Policy never speaks to ROS directly. It speaks to KuavoBaseRosEnv.
+
+Abstraction: The Env class handles the dirty work: converting normalized actions (-1 to 1) into joint angles (radians), and converting ROS images (uint8) into tensors (float32).
+
+Safety: The Bridge layer acts as a safety filter, clamping actions to arm_min/arm_max defined in configs/deploy/kuavo_env.yaml before publishing to hardware.
+
+4.2 Configuration-Driven Development
+
+Hydra-First: All entry points (train, convert, eval) must accept a Hydra configuration object or path.
+
+No Hardcoding: Sensor names (e.g., cam_high, cam_left_wrist), joint lists, and control frequencies (30Hz vs 60Hz) must be loaded from configs/.
+
+4.3 Multi-Modal Data Flow
+
+RGB-D First: The system is designed to handle Depth as a first-class citizen.
+
+Flow: Rosbag (Depth) -> Processer (Align) -> Parquet (Encoded) -> DatasetWrapper (Decode) -> Augmenter (Geo-Transform) -> Policy.
+
+5. Documentation: readme/ & docs/
+
+README.md: High-level setup and quickstart.
+
+kuavo_deploy/readme/: Specific guides for the hardest part of the stack—deployment.
+
+setup_env.md: How to configure the ROS environment.
+
+setup_robot_connection.md: Network and IP configuration for the real robot.
+
+inference.md: How to run the evaluation scripts.
+
+6. Implementation Guidelines
+
+6.1 Hardware Interfacing
+
+Control Mode: Currently, only Joint Position Control is supported.
+
+End Effectors: The code must support dynamic switching between qiangnao (Dex Hand), leju_claw (Gripper), and rq2f85 via the eef_type config parameter.
+
+Arms: Support left, right, or both. The KuavoBaseRosEnv must dynamically adjust the action space dimension based on this config.
+
+6.2 Safety Mechanisms
+
+KeyListener: In deployment, kuavo_data.common.key_listener must be active to allow immediate termination (Esc) or pausing of the robot during autonomous execution.
+
+Zero-Action on Stop: If the policy is paused or stopped, the Env must publish current joint states as commands (hold position) to prevent collapse.
+
+6.3 Dependency Management
+
+Training Node: Use requirements_ilcode.txt. Does not require ROS. Can run on any CUDA server.
+
+Robot Node: Use requirements_total.txt. Requires ROS Noetic. Runs on the robot's internal PC or a tethered workstation.
+
+7. Benefits of this Structure
+
+Reproducibility: Splitting configs from code ensures that experiments (training runs) are reproducible by simply sharing the .yaml file.
+
+Sim-to-Real Parity: By sharing the KuavoBaseRosEnv logic, the Policy "sees" the same interface whether it is in Sim or Real, reducing the Sim-to-Real gap.
+
+Modularity: New robot hardware can be supported by adding a new Kuavo*Env class without changing the training code.
+
+Scalability: The patching system allows leveraging the fast-moving LeRobot ecosystem while maintaining custom proprietary features (Depth support).

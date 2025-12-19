@@ -9,6 +9,7 @@ from pprint import pprint
 import os
 import glob
 from collections import defaultdict
+from typing import Callable, Optional
 
 # ================ 机器人关节信息定义 ================
 
@@ -450,6 +451,9 @@ class KuavoRosbagReader:
     def process_rosbag(self, bag_file: str):
         """
         Process the rosbag file and return the processed data.
+        
+        Note: This method loads all data into memory. For large rosbags, 
+        consider using process_rosbag_streaming() instead.
 
         Args:
             bag_file (str): The path to the rosbag file.
@@ -473,6 +477,119 @@ class KuavoRosbagReader:
         data_aligned = self.align_frame_data(data)
         
         return data_aligned
+    
+    def process_rosbag_streaming(self, bag_file: str, frame_callback: Callable[[dict], None], 
+                                  chunk_size: int | None = None):
+        """
+        流式处理rosbag，边读取边对齐边处理，减少内存占用。
+        
+        实现方式：
+        1. 第一遍扫描：只读取时间戳，确定主时间线和时间戳序列（不加载图像数据）
+        2. 第二遍扫描：按主时间线流式读取，边对齐边调用frame_callback处理
+        
+        Args:
+            bag_file: rosbag文件路径
+            frame_callback: 对齐后的帧数据回调函数，接收一个dict，包含所有对齐后的数据
+            chunk_size: 每处理多少帧后可以做一些清理（可选）
+        
+        Note:
+            - 第一遍扫描只读取时间戳，内存占用很小
+            - 第二遍扫描需要加载所有消息数据，但可以边处理边释放
+            - 对于超大rosbag，建议配合populate_dataset的chunk_size使用
+        """
+        from .kuavo_dataset_streaming import StreamingRosbagProcessor
+        
+        processor = StreamingRosbagProcessor(
+            msg_processer=self._msg_processer,
+            topic_process_map=self._topic_process_map,
+            camera_names=DEFAULT_CAMERA_NAMES,
+            train_hz=TRAIN_HZ,
+            main_timeline_fps=MAIN_TIMELINE_FPS,
+            sample_drop=SAMPLE_DROP,
+            only_half_up_body=ONLY_HALF_UP_BODY
+        )
+        
+        # 第一遍：扫描时间戳
+        main_timeline, main_timestamps, topic_timestamps = processor.scan_timestamps(bag_file)
+        
+        # 第二遍：流式处理
+        processor.stream_process_rosbag(
+            bag_file=bag_file,
+            main_timeline=main_timeline,
+            main_timestamps=main_timestamps,
+            frame_callback=frame_callback,
+            chunk_size=chunk_size
+        )
+    
+    def process_rosbag_chunked(
+        self,
+        bag_file: str,
+        frame_callback: Callable[[dict, int], None],
+        chunk_size: int = 100,
+        save_callback: Optional[Callable[[], None]] = None
+    ) -> int:
+        """
+        分块流式处理rosbag（推荐用于超大rosbag）
+        
+        参考Diffusion Policy的按需读取方式：
+        1. 第一遍扫描：只读取时间戳（内存占用极小，只有几MB）
+        2. 第二遍扫描：按时间窗口分块读取+对齐+处理
+        
+        与process_rosbag的区别：
+        - process_rosbag: 一次性加载所有数据到内存（内存峰值巨大）
+        - process_rosbag_chunked: 分块读取，边读边对齐边处理（内存可控）
+        
+        Args:
+            bag_file: rosbag文件路径
+            frame_callback: 处理每帧的回调函数 (aligned_frame, frame_idx) -> None
+                           aligned_frame包含所有话题的对齐数据
+            chunk_size: 每个chunk包含的帧数（默认100帧）
+            save_callback: 每个chunk处理完后的回调（用于保存dataset和释放内存）
+        
+        Returns:
+            处理的总帧数
+            
+        Example:
+            def on_frame(aligned_frame, frame_idx):
+                # 处理对齐后的帧，添加到dataset
+                dataset.add_frame(...)
+            
+            def on_chunk_done():
+                # 保存当前chunk，释放内存
+                dataset.save_episode()
+                gc.collect()
+            
+            reader.process_rosbag_chunked(
+                bag_file="large.bag",
+                frame_callback=on_frame,
+                chunk_size=100,
+                save_callback=on_chunk_done
+            )
+        """
+        from .kuavo_dataset_chunked import ChunkedRosbagProcessor
+        
+        processor = ChunkedRosbagProcessor(
+            msg_processer=self._msg_processer,
+            topic_process_map=self._topic_process_map,
+            camera_names=DEFAULT_CAMERA_NAMES,
+            train_hz=TRAIN_HZ,
+            main_timeline_fps=MAIN_TIMELINE_FPS,
+            sample_drop=SAMPLE_DROP,
+            only_half_up_body=ONLY_HALF_UP_BODY
+        )
+        
+        # 第一遍：只扫描时间戳（内存占用极小）
+        main_timeline, main_timestamps, all_timestamps = processor.scan_timestamps_only(bag_file)
+        
+        # 第二遍：分块处理
+        return processor.process_in_chunks(
+            bag_file=bag_file,
+            main_timestamps=main_timestamps,
+            all_timestamps=all_timestamps,
+            frame_callback=frame_callback,
+            chunk_size=chunk_size,
+            save_callback=save_callback
+        )
     
     def align_frame_data(self, data: dict):
         aligned_data = defaultdict(list)

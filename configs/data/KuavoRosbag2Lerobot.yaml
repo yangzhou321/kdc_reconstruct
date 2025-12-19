@@ -11,6 +11,9 @@ rosbag:
   rosbag_dir: /path/to/your/rosbag  # rosbag文件所在目录
   num_used: null # 使用的rosbag数量(若设置为任意数字，则会随机采样选择)
   lerobot_dir: /path/to/your/lerobot/save/file  # 转换后的lerobot文件的保存目录
+  chunk_size: 1000  # 内存优化：分批处理大小（帧数）。对于超大rosbag（7-10G），建议设置为1000-2000。
+                     # 设置为0或null可禁用分批处理（仅在episode结束时保存，内存占用较大）
+                     # 注意：启用分批处理时，大episode会被分成多个小episode保存
 
 dataset:
   #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

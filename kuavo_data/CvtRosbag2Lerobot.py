@@ -283,7 +283,19 @@ def populate_dataset(
     bag_files: list[Path],
     task: str,
     episodes: list[int] | None = None,
+    chunk_size: int = 1000,  # 每处理chunk_size帧就保存一次，减少内存占用
 ) -> LeRobotDataset:
+    """
+    Populate dataset with rosbag data, with memory optimization for large rosbags.
+    
+    Args:
+        dataset: LeRobotDataset instance
+        bag_files: List of rosbag file paths
+        task: Task description
+        episodes: List of episode indices to process (None for all)
+        chunk_size: Number of frames to process before saving (default: 1000)
+                    Set to 0 or None to disable chunking (save only at end of episode)
+    """
     if episodes is None:
         episodes = range(len(bag_files))
     failed_bags = []
@@ -447,6 +459,108 @@ def populate_dataset(
 
         num_frames = state.shape[0]
 
+        # 内存优化：分批处理大episode
+        # 如果chunk_size为0或None，则禁用分批处理（仅在episode结束时保存）
+        use_chunking = chunk_size and chunk_size > 0 and num_frames > chunk_size
+        
+        # 记录初始内存使用（如果可用）
+        initial_memory_mb = None
+        process = None
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            initial_memory_mb = process.memory_info().rss / 1024 / 1024
+        except (ImportError, AttributeError):
+            pass
+        
+        if use_chunking:
+            log_print.info(f"Large episode detected ({num_frames} frames). Using chunked processing with chunk_size={chunk_size}")
+            if initial_memory_mb is not None:
+                log_print.info(f"Initial memory usage: {initial_memory_mb:.2f} MB")
+            num_chunks = (num_frames + chunk_size - 1) // chunk_size  # 向上取整
+            
+            # 保存初始episode_index，确保所有chunk使用同一个episode
+            # 注意：由于LerobotDataset的设计，每个save_episode()会创建一个新episode
+            # 为了内存优化，我们接受将大episode分成多个小episode的权衡
+            # 如果需要保持单个episode，需要修改LerobotDataset的核心逻辑
+            
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * chunk_size
+                end_idx = min((chunk_idx + 1) * chunk_size, num_frames)
+                chunk_frames = end_idx - start_idx
+                
+                log_print.info(f"Processing chunk {chunk_idx + 1}/{num_chunks} (frames {start_idx}-{end_idx-1})")
+                
+                # 处理当前chunk的帧
+                for i in range(start_idx, end_idx):
+                    if kuavo.USE_LEJU_CLAW or kuavo.USE_QIANGNAO:
+                        hand_type = "LEJU" if kuavo.USE_LEJU_CLAW else "QIANGNAO"
+                        s_list, a_list = [], []
+                        if kuavo.CONTROL_HAND_SIDE in ("left", "both"):
+                            s, a = get_hand_data(i, 0, hand_type)
+                            s_list.append(s); a_list.append(a)
+                        if kuavo.CONTROL_HAND_SIDE in ("right", "both"):
+                            s, a = get_hand_data(i, 1, hand_type)
+                            s_list.append(s); a_list.append(a)
+                        output_state = np.concatenate(s_list).astype(np.float32)
+                        output_action = np.concatenate(a_list).astype(np.float32)
+                    else:
+                        # 如果没有使用手部，直接使用原始数据
+                        output_state = state[i].astype(np.float32)
+                        output_action = action[i].astype(np.float32)
+                    
+                    final_action = output_action
+                    final_state = output_state
+
+                    # 处理cmd_pos_world和gap_flag
+                    if not kuavo.ONLY_HALF_UP_BODY:
+                        cmd_pos_world = cmd_pos_world_action[i]
+                        gap_flag = 1.0 if np.any(action_kuavo_arm_traj[i] == 999.0) else 0.0
+                        final_action = np.concatenate([
+                            final_action,
+                            cmd_pos_world,
+                            np.array([gap_flag], dtype=np.float32)
+                        ], axis=0)
+                    
+                    frame = {
+                        "observation.state": torch.from_numpy(final_state).type(torch.float32),
+                        "action": torch.from_numpy(final_action).type(torch.float32),
+                    }
+                    
+                    for camera, img_array in imgs_per_cam.items():
+                        if "depth" in camera:
+                            min_depth, max_depth = kuavo.DEPTH_RANGE[0], kuavo.DEPTH_RANGE[1]
+                            frame[f"observation.{camera}"] = np.clip(img_array[i], min_depth, max_depth)
+                        else:
+                            frame[f"observation.images.{camera}"] = img_array[i]
+                    
+                    if velocity is not None:
+                        frame["observation.velocity"] = velocity[i]
+                    if effort is not None:
+                        frame["observation.effort"] = effort[i]
+                    
+                    dataset.add_frame(frame, task=task)
+                
+                # 保存当前chunk并释放内存
+                # 注意：每个chunk会成为一个独立的episode，这是为了内存优化的权衡
+                log_print.info(f"Saving chunk {chunk_idx + 1}/{num_chunks} to reduce memory usage...")
+                dataset.save_episode()
+                # 重置hf_dataset以释放内存
+                dataset.hf_dataset = dataset.create_hf_dataset()
+                
+                # 释放已处理的数据引用，帮助GC
+                import gc
+                gc.collect()
+                
+                # 记录内存使用情况
+                if initial_memory_mb is not None and process is not None:
+                    try:
+                        current_memory_mb = process.memory_info().rss / 1024 / 1024
+                        log_print.info(f"Chunk {chunk_idx + 1}/{num_chunks} saved. Memory: {current_memory_mb:.2f} MB (increase: {current_memory_mb - initial_memory_mb:.2f} MB)")
+                    except Exception:
+                        pass
+        else:
+            # 原始处理方式：一次性处理所有帧
         for i in range(num_frames):
             if kuavo.USE_LEJU_CLAW or kuavo.USE_QIANGNAO:
                 hand_type = "LEJU" if kuavo.USE_LEJU_CLAW else "QIANGNAO"
@@ -459,44 +573,17 @@ def populate_dataset(
                     s_list.append(s); a_list.append(a)
                 output_state = np.concatenate(s_list).astype(np.float32)
                 output_action = np.concatenate(a_list).astype(np.float32)
-
-            # # ~~~~~~~~~~~~~~~~~~~~~~~~~手臂关节角度范围限制，防止有数据超限 ~~~~~~~~~~~~~~~~~~~~~~~~~
-            # assert len(DEFAULT_ARM_JOINT_RANGE) >= 16, "DEFAULT_ARM_JOINT_RANGE should have at least 16 joint ranges"
-
-            # if kuavo.CONTROL_HAND_SIDE == "left":
-            #     joint_indices = range(0, 8)
-            # elif kuavo.CONTROL_HAND_SIDE == "right":
-            #     joint_indices = range(8, 16)
-            # elif kuavo.CONTROL_HAND_SIDE == "both":
-            #     joint_indices = range(0, 16)
-            # else:
-            #     raise ValueError(f"Invalid CONTROL_HAND_SIDE: {kuavo.CONTROL_HAND_SIDE}")
-
-            # # 保证 output_action 长度匹配选中的手臂
-            # assert len(joint_indices) == output_action.shape[0], (
-            #     f"Expected output_action of length {len(joint_indices)}, "
-            #     f"but got {output_action.shape[0]}"
-            # )
-
-            # for enu_i, jidx_k in enumerate(joint_indices):
-            #     low, high = DEFAULT_ARM_JOINT_RANGE[jidx_k]
-            #     if output_action[enu_i] < low:
-            #         output_action[enu_i] = low
-            #     elif output_action[enu_i] > high:
-            #         output_action[enu_i] = high
-            # # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
+                else:
+                    output_state = state[i].astype(np.float32)
+                    output_action = action[i].astype(np.float32)
                 
             final_action = output_action
             final_state = output_state
 
-
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~deal with cmd_pos_world and gap_flag under task4 ~~~~~~~~~~~~~~~~~~~~~~~~~
+                # 处理cmd_pos_world和gap_flag
             if not kuavo.ONLY_HALF_UP_BODY:
                 cmd_pos_world = cmd_pos_world_action[i]
-                # 6. 断点标志 (1维): 检查action_kuavo_arm_traj是否包含999
                 gap_flag = 1.0 if np.any(action_kuavo_arm_traj[i] == 999.0) else 0.0
-                # 合并所有action
                 final_action = np.concatenate([
                     final_action,
                     cmd_pos_world,
@@ -504,21 +591,14 @@ def populate_dataset(
                 ], axis=0)
             
             frame = {
-                "observation.state": torch.from_numpy(final_state).type(torch.float32),      # left+right: pos+rot6d+gripper;  dim: 2*10           
-                "action": torch.from_numpy(final_action).type(torch.float32),                # left+right: pos+rot6d+gripper;  dim: 2*10                  
+                    "observation.state": torch.from_numpy(final_state).type(torch.float32),
+                    "action": torch.from_numpy(final_action).type(torch.float32),
             }
-
-            # frame = {
-            #     "observation.state": torch.from_numpy(output_state).type(torch.float32),
-            #     "action": torch.from_numpy(output_action).type(torch.float32),
-            # }
             
             for camera, img_array in imgs_per_cam.items():
                 if "depth" in camera:
-                    # frame[f"observation.{camera}"] = img_array[i]
-                    min_depth, max_dpeth = kuavo.DEPTH_RANGE[0], kuavo.DEPTH_RANGE[1]
-                    frame[f"observation.{camera}"] = np.clip(img_array[i], min_depth, max_dpeth)
-                    print("[info]: Clip depth in range %d ~ %d"%(min_depth, max_dpeth))
+                        min_depth, max_depth = kuavo.DEPTH_RANGE[0], kuavo.DEPTH_RANGE[1]
+                        frame[f"observation.{camera}"] = np.clip(img_array[i], min_depth, max_depth)
                 else:
                     frame[f"observation.images.{camera}"] = img_array[i]
             
@@ -527,27 +607,11 @@ def populate_dataset(
             if effort is not None:
                 frame["observation.effort"] = effort[i]
 
-            # frame["task"] = task
-            # diagnose_frame_data(frame)
             dataset.add_frame(frame, task=task)
-        # dataset.save_episode(task="Pick the black workpiece from the white conveyor belt on your left and place it onto the white box in front of you",)
-        # raise ValueError("stop!")
 
-
-        # usage = resource.getrusage(resource.RUSAGE_SELF)
-        # print(f"~~~~~~~~~~~~~~Before Memory usage: {usage.ru_maxrss / 1024:.2f} MB")
-        # print(dataset.episode_buffer)
+            # 保存整个episode
         dataset.save_episode()
-        # usage = resource.getrusage(resource.RUSAGE_SELF)
-        # print(f"~~~~~~~~~~~~~~After Memory usage: {usage.ru_maxrss / 1024:.2f} MB")
-        # print(dataset.episode_buffer)
-        # sizes = get_attr_sizes(dataset)
-        # for k, v in sizes.items():
-        #     print(f"{k}: {v/1024/1024:.2f} MB")
-        # visualize_memory(sizes, top_n=10)
-        # dataset.hf_dataset = None  # reduce memory usage in data convert
-        # del dataset.hf_dataset
-        dataset.hf_dataset = dataset.create_hf_dataset()  # reset to reduce memory usage in data convert
+            dataset.hf_dataset = dataset.create_hf_dataset()
 
     # 将失败的bag文件写入error.txt
     if failed_bags:
@@ -573,6 +637,7 @@ def port_kuavo_rosbag(
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
     root: str,
     n: int | None = None,
+    chunk_size: int = 1000,  # 内存优化：分批处理大小，0或None表示禁用
 ):
     # Download raw data if not exists
     if (LEROBOT_HOME / repo_id).exists():
@@ -605,6 +670,7 @@ def port_kuavo_rosbag(
         bag_files,
         task=task,
         episodes=episodes,
+        chunk_size=chunk_size,
     )
     # dataset.consolidate()
     
@@ -653,7 +719,9 @@ def main(cfg: DictConfig):
     #                                 + kuavo.DEFAULT_ARM_JOINT_NAMES[half_arm:] + kuavo.DEFAULT_DEXHAND_JOINT_NAMES[half_dexhand:]             
     #     DEFAULT_JOINT_NAMES_LIST = kuavo.DEFAULT_LEG_JOINT_NAMES + DEFAULT_ARM_JOINT_NAMES + kuavo.DEFAULT_HEAD_JOINT_NAMES
 
-    port_kuavo_rosbag(raw_dir, repo_id, root=lerobot_dir,n = n, task=kuavo.TASK_DESCRIPTION)
+    # 从配置中获取chunk_size，用于内存优化（默认1000帧）
+    chunk_size = cfg.rosbag.get("chunk_size", 1000) if hasattr(cfg, 'rosbag') and hasattr(cfg.rosbag, 'get') else 1000
+    port_kuavo_rosbag(raw_dir, repo_id, root=lerobot_dir, n=n, task=kuavo.TASK_DESCRIPTION, chunk_size=chunk_size)
 
 if __name__ == "__main__":
     
