@@ -1,0 +1,71 @@
+# Rosbag转换性能测试依赖文件
+# 此文件包含运行测试脚本所需的最小依赖，可在无GPU设备上运行
+#
+# 安装方法：
+#   pip install -r requirements_test.txt
+#
+# 注意：ROS相关包需要从rospypi安装，请先执行：
+#   pip install --extra-index-url https://rospypi.github.io/simple/ rospy rosbag roslz4 cv-bridge sensor-msgs
+
+# ========== 核心依赖 ==========
+# 数据处理
+numpy>=2.0.0,<3.0.0
+
+# 内存监控（测试必需，用于性能分析）
+psutil>=5.9.0
+
+# 进度条显示（可选，但推荐）
+tqdm>=4.65.0
+
+# 配置管理（用于初始化默认配置）
+omegaconf>=2.3.0
+
+# ========== ROS相关依赖 ==========
+# 注意：ROS包需要从rospypi安装，使用以下命令：
+# pip install --extra-index-url https://rospypi.github.io/simple/ \
+#     rospy==1.17.4 \
+#     rosbag==1.17.4 \
+#     roslz4==1.17.4 \
+#     cv-bridge==1.16.2 \
+#     sensor-msgs==1.13.2 \
+#     rospkg==1.6.0
+
+# ROS Python接口（用于rosbag读取）
+# rospy==1.17.4
+# rosbag==1.17.4
+# roslz4==1.17.4
+
+# 图像处理（如果需要处理图像数据）
+# cv-bridge==1.16.2
+# opencv-python-headless>=4.8.0  # 无GUI版本，适合服务器环境
+
+# ROS消息类型
+# sensor-msgs==1.13.2
+
+# ROS包管理
+# rospkg==1.6.0
+
+# ========== 项目内部依赖 ==========
+# 安装项目本身（editable模式）
+-e .
+
+# ========== 可选依赖（用于完整功能测试） ==========
+# 如果需要测试完整的转换流程（包括写入dataset），还需要：
+# pyarrow>=10.0.0  # Parquet文件支持
+# pandas>=2.0.0    # 数据处理
+
+# ========== 说明 ==========
+# 1. 此文件不包含PyTorch、CUDA等深度学习依赖，适合在无GPU设备上运行性能测试
+# 2. ROS包安装需要额外的索引源，请参考上面的注释
+# 3. 如果只需要测试时间戳扫描和对齐逻辑，可以注释掉cv-bridge和opencv相关依赖
+# 4. 完整安装命令示例：
+#
+#    # 方法1：使用rospypi（推荐）
+#    pip install --extra-index-url https://rospypi.github.io/simple/ \
+#        rospy rosbag roslz4 cv-bridge sensor-msgs rospkg
+#    pip install -r requirements_test.txt
+#
+#    # 方法2：如果系统已安装ROS Noetic，可以直接使用系统包
+#    # 确保ROS环境已source：source /opt/ros/noetic/setup.bash
+#    pip install -r requirements_test.txt
+

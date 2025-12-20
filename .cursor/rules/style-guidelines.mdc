@@ -1,0 +1,233 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+#CODEBASE STYLING GUIDELINES
+
+You MUST follow these coding guidelines when adding ANY code to the codebase
+
+##(1) Types
+- Symblos and BigInts cannot be faithfully polyfilled, so they should not be used when targeting browsers/environments that don't support them nativaly
+- write everything in English
+
+##(2) References
+- Use `const` for all of your references; avoid using `var`.
+- If you must reassign references, use `let` instead of `var`.
+- Both `let` and `const` are block-scoped, whereas `var` is function-scoped.
+
+
+##(3) Objects
+- Use the literal syntax `{}` for object creation.
+- Use computed property names when creating objects with dynamic property names.
+- Use object method shorthand.
+- Use property value shorthand.
+- Group your shorthand properties at the beginning of your object declaration.
+- Only quote properties that are invalid identifiers.
+- Do not call `Object.prototype` methods directly, such as `hasOwnProperty`, `propertyIsEnumerable`, and `isPrototypeOf`. Use `Object.prototype.hasOwnProperty.call(object, key)` or `Object.hasOwn(object, key)`.
+- Prefer the object spread syntax (`{ ...original, c: 3 }`) over `Object.assign()` to shallow-copy objects. Use the object rest parameter syntax (`const { a, ...noA } = copy;`) to get a new object with certain properties omitted.
+
+
+##(4) Arrays
+- Use the literal syntax `[]` for array creation.
+- Use `Array#push` instead of direct assignment to add items to an array.
+- Use array spreads (`...`) to copy arrays.
+- To convert an iterable object to an array, use spreads (`...`) instead of `Array.from`.
+- Use `Array.from` for converting an array-like object to an array.
+- Use `Array.from` instead of spread (`...`) for mapping over iterables.
+- Use `return` statements in array method callbacks, unless the function body is a single statement returning an expression without side effects.
+- Use line breaks after opening array brackets and before closing array brackets, if an array has multiple lines.
+
+##(5) Destructuring
+- Use object destructuring when accessing and using multiple properties of an object.
+- Use array destructuring.
+- Use object destructuring for multiple return values, not array destructuring.
+
+##(6) Strings
+- Use single quotes `''` for strings. Template literals `` ` `` should contain interpolation or newlines.
+- Do not write strings that cause the line to go over 100 characters across multiple lines using string concatenation.
+- When programmatically building up strings, use template literals instead of concatenation.
+- Never use `eval()` on a string.
+- Do not unnecessarily escape characters in strings.
+
+##(7) Functions
+- Use named function expressions instead of function declarations.
+- Wrap immediately invoked function expressions in parentheses.
+- Never declare a function in a non-function block (e.g., `if`, `while`). Assign the function to a variable instead.
+- ECMA-262 defines a block as a list of statements; a function declaration is not a statement.
+- Never name a parameter `arguments`.
+- Never use `arguments`; opt to use rest syntax (`...`) instead.
+- Use default parameter syntax rather than mutating function arguments.
+- Avoid side effects with default parameters.
+- Always put default parameters last.
+- Never use the `Function` constructor to create a new function.
+- Maintain consistent spacing in a function signature: no space between the function name and `()`, one space before `{}`.
+- Never mutate parameters.
+- Never reassign parameters.
+- Prefer the use of the spread syntax (`...`) to call variadic functions.
+- Functions with multiline signatures or invocations should be indented with each item on a line by itself and a trailing comma on the last item.
+
+##(8) Arrow Functions
+- When you must use an anonymous function (e.g., as an inline callback), use arrow function notation.
+- If the function body consists of a single statement returning an expression without side effects, omit the braces and use implicit return. Otherwise, keep the braces and use a `return` statement.
+- If an implicitly returned expression spans over multiple lines, wrap it in parentheses for better readability.
+- Always include parentheses around arguments for clarity and consistency.
+- Avoid confusing arrow function syntax (`=>`) with comparison operators (`<=`, `>=`).
+- Enforce the location of arrow function bodies with implicit returns.
+
+##(9) Classes & Constructors
+- Always use the `class` keyword. Avoid manipulating `prototype` directly.
+- Use `extends` for inheritance.
+- Methods can return `this` to help with method chaining.
+- You may write a custom `toString()` method, ensuring it works successfully and causes no side effects.
+- An empty constructor function or one that just delegates to a parent class's constructor is unnecessary if no specific initialization logic is present.
+- Avoid duplicate class members.
+- Class methods should use `this` or be made into a `static` method unless an external library or framework dictates otherwise.
+
+##(10) Modules
+- Always use ES6 `import` and `export` syntax for modules over a non-standard module system.
+- Do not use wildcard imports (`import * as Name from './path';`).
+- Do not export directly from an `import` statement.
+- Only import from a specific module path in one place per file.
+- Do not export mutable bindings (i.e., `let` or `var` variables).
+- In modules with a single export, prefer a default export over a named export.
+- Put all `import` statements at the very top of the file, before any other non-import statements.
+- For multiline imports, indent each named import on a new line, and include a trailing comma after the last item.
+- Disallow Webpack loader syntax directly within module `import` statements.
+- Do not include JavaScript filename extensions (e.g., `.js`, `.jsx`) in module `import` statements.
+
+##(11) Iterators and Generators
+- Do not use traditional iterators like `for-in` or `for-of` loops for arrays. Prefer JavaScript's higher-order functions such as `map()`, `every()`, `filter()`, `find()`, `findIndex()`, `reduce()`, and `some()`. For objects, use `Object.keys()`, `Object.values()`, or `Object.entries()` to produce arrays for iteration.
+- Do not use generators.
+- If you must use generators, ensure their function signature is spaced properly, e.g., `function* foo() {}`.
+
+##(12) Properties
+- Use dot notation when accessing properties by their literal name (e.g., `object.propertyName`).
+- Use bracket notation `[]` when accessing properties with a variable (e.g., `object[variableName]`) or when the property name is an invalid identifier.
+- Use the exponentiation operator (`**`) for calculating exponentiations.
+
+##(13) Variables
+- Always use `const` or `let` to declare variables.
+- Use one `const` or `let` declaration per variable or assignment.
+- Group all `const` declarations together, then group all `let` declarations.
+- Assign variables where they are needed, but place them in a reasonable location within their scope.
+- Do not chain variable assignments (e.g., `let a = b = c = 1`).
+- Avoid using unary increments (`++`) and decrements (`--`).
+- Avoid line breaks immediately before or after the assignment operator (`=`). If the line length exceeds limits, surround the assigned value in parentheses.
+- Disallow unused variables.
+
+##(14) Hoisting
+- Understand that `var` declarations are hoisted to the top of their function scope, but their assignments are not. `const` and `let` declarations are also hoisted but are subject to Temporal Dead Zones (TDZ), making them inaccessible before their declaration.
+- Anonymous function expressions hoist their variable name, but not the function assignment itself.
+- Named function expressions hoist the variable name, not the internal function name or the function body.
+- Function declarations hoist both their name and their entire function body.
+- Define variables, classes, and functions before they are used.
+
+##(15) Comparison Operators & Equality
+- Use strict equality (`===`) and strict inequality (`!==`) operators instead of loose equality (`==`) and loose inequality (`!=`).
+- Understand how conditional statements (e.g., `if`) evaluate expressions to boolean values: objects evaluate to `true`, `undefined` and `null` to `false`, `+0`, `-0`, `NaN` to `false`, and empty strings `''` to `false`.
+- Use concise shortcuts for boolean variables (e.g., `if (isValid)`). For strings and numbers, use explicit comparisons (e.g., `if (name !== '')` or `if (collection.length > 0)`).
+- When `case` or `default` clauses within a `switch` statement contain lexical declarations (`let`, `const`, `function`, `class`), enclose them in braces `{}` to create a new lexical scope.
+- Ternary operators should not be nested and should generally be simple, single-line expressions.
+- Avoid unneeded ternary statements where logical operators (`||`, `&&`) or boolean coercion (`!!`) can achieve the same result more concisely.
+- When mixing different types of operators (e.g., logical and arithmetic), enclose them in parentheses to explicitly define precedence and clarify intent. Exceptions are standard arithmetic operators `+`, `-`, and `**`; however, `*` and `/` should be parenthesized if mixed.
+- Use the nullish coalescing operator (`??`) to provide a default value only when the left-hand side operand is strictly `null` or `undefined`.
+
+##(16) Blocks
+- Always use braces (`{}`) with all multiline blocks (e.g., `if`, `for`, `while`, `do...while`, `switch` statements).
+- When using multiline `if` and `else` blocks, place the `else` keyword on the same line as the closing brace of the `if` block.
+- If an `if` block always executes a `return` statement, the subsequent `else` block is unnecessary. An `else if` block following an `if` block with a `return` can be separated into multiple `if` blocks.
+
+##(17) Control Statements
+- If a control statement's condition (e.g., for `if`, `while`) is very long or exceeds the maximum line length, place each grouped condition on a new line, and the logical operator (`&&` or `||`) should begin that new line.
+- Do not use selection operators (e.g., `!isRunning && startRunning();`) as a shorthand replacement for explicit control statements.
+
+##(18) Comments
+- Use `/** ... */` for multiline comments, especially for JSDoc-style documentation.
+- Use `//` for single-line comments. Place single-line comments on a new line directly above the code they describe. Add an empty line before the comment unless it is on the first line of a block.
+- Start all comments with a single space after the comment delimiters (`// ` or `* `).
+- Prefix comments with `FIXME:` or `TODO:` for actionable notes.
+- Use `// FIXME:` to annotate problems in the code that require attention.
+- Use `// TODO:` to annotate potential solutions or features that need to be implemented.
+
+##(19) Whitespace
+- Use soft tabs (space characters) set to 2 spaces for indentation.
+- Place a single space before the leading curly brace (`{`) of a block.
+- Place a single space before the opening parenthesis in control statements (e.g., `if (condition)`). Do not place any space between the function name and the opening parenthesis in function calls or declarations (e.g., `functionName()`).
+- Set off operators with spaces (e.g., `const x = y + 5;`).
+- End files with a single newline character.
+- Use indentation when making long method chains (more than two method calls). Each subsequent method call should begin on a new line with a leading dot.
+- Leave a blank line after blocks (e.g., `if` blocks, function bodies) and before the next statement.
+- Do not pad your blocks with blank lines (no blank line immediately after an opening brace or immediately before a closing brace).
+- Do not use multiple blank lines consecutively; limit consecutive blank lines to a maximum of one.
+- Do not add spaces immediately inside parentheses (e.g., `function bar(foo)` not `function bar( foo )`).
+- Do not add spaces immediately inside brackets for array literals or when accessing array elements/object properties with bracket notation (e.g., `const arr =;` not `[ 1, 2 ]`, and `array` not `array[ 0 ]`).
+- Add spaces immediately inside curly braces for object literals (e.g., `const foo = { key: 'value' };` not `{key:'value'}`).
+- Avoid having lines of code that exceed 100 characters in length, including whitespace. Long strings are exempt from this rule and should not be broken up.
+- Enforce consistent spacing inside an open block token (`{`) and the next token on the same line, as well as inside a close block token (`}`) and the previous token on the same line.
+- Avoid spaces before commas and require a space after commas (e.g., `const foo = 1, bar = 2;`).
+- Do not add spaces inside computed property brackets (e.g., `obj[propertyName]` not `obj[ propertyName ]`).
+- Avoid spaces between function names and their invocations (e.g., `func();` not `func ();`).
+- Enforce spacing between keys and values in object literal properties (e.g., `key: value` not `key:value`).
+- Avoid trailing spaces at the end of lines.
+- Avoid multiple empty lines, allow only one newline at the very end of the file, and avoid any newlines at the beginning of the file.
+
+##(20) Commas
+- Do not use leading commas.
+- Always use trailing commas for multiline arrays, multiline objects, and multiline function parameters/arguments.
+
+##(21) Semicolons
+- Always use semicolons to explicitly terminate statements.
+
+##(22) Type Casting & Coercion
+- Perform explicit type coercion at the beginning of the statement.
+- For converting values to strings, use the `String()` constructor as a function (e.g., `String(value)`). Avoid `new String()`, implicit string concatenation (`'' + value`), or the `toString()` method.
+- For converting values to numbers, use the `Number()` constructor as a function (e.g., `Number(value)`). When parsing strings into integers, always use `parseInt()` with a specified radix (e.g., `parseInt(string, 10)`).
+- If using a bitshift operation (e.g., `value >> 0`) for performance to coerce a string to a number, include a comment explaining the specific reason.
+- Be careful when using bitshift operations as they always return a 32-bit integer, which can cause unexpected behavior for integer values larger than 32 bits.
+- For converting values to booleans, use the `Boolean()` constructor as a function (e.g., `Boolean(value)`) or the double negation operator (`!!value`). Avoid `new Boolean()`.
+
+##(23) Naming Conventions
+- Avoid single-letter names unless in very specific, well-understood contexts (e.g., loop counters `i`, `j`).
+- Use `camelCase` when naming objects, functions, and instances.
+- Use `PascalCase` only when naming constructors or classes.
+- Do not use leading or trailing underscores (e.g., `_privateField`) to denote "private" or "protected" properties or methods.
+- Do not save references to `this` (e.g., `const self = this;`). Use arrow functions or `Function#bind`.
+- A base filename should exactly match the name of its default export.
+- Use `camelCase` when a function is the default export of a module, and the filename should be identical to the function's name.
+- Use `PascalCase` when a constructor, class, singleton, function library, or bare object is the default export.
+- Acronyms and initialisms within names should be consistently either all-uppercase or all-lowercase (e.g., `SMSContainer` or `smsContainer`).
+- You may optionally uppercase a constant (using `UPPERCASE_SNAKE_CASE`) only if it is exported from a module, is declared with `const` and cannot be reassigned, and its value (and nested properties) can be reliably trusted to remain immutable.
+
+##(24) Accessors
+- Accessor functions (getters and setters) for properties are not strictly required.
+- Do not use JavaScript's native getter/setter syntax (e.g., `get propertyName()`). If accessor functions are needed, use conventional method naming like `getVal()` and `setVal('hello')`.
+- If a property or method represents a boolean value, use `isVal()` or `hasVal()` for its accessor function name.
+- It is acceptable to create generic `get(key)` and `set(key, val)` functions for a class, provided their usage is consistent.
+
+##(25) Events
+- When attaching data payloads to events (DOM or custom), pass an object literal (`{}`) instead of a raw value.
+
+##(26) jQuery
+- Prefix jQuery object variables with a dollar sign (`$`).
+- Cache jQuery lookups.
+- For DOM queries, use cascading selectors (e.g., `$('.sidebar ul')`) or direct parent-child selectors (e.g., `$('.sidebar > ul')`).
+- Use the `find()` method on a scoped jQuery object (e.g., `$sidebar.find('ul')`) rather than passing the scope as a second argument to the `$` function.
+
+##(27) ECMAScript 5 Compatibility
+- Refer to Kangax's ES5 compatibility table for information regarding ECMAScript 5 feature compatibility across different JavaScript environments and browsers.
+
+##(28) ECMAScript 6+ (ES 2015+) Styles
+- This section encourages the use of modern ES6+ features including Arrow Functions, Classes, Object Shorthand, Template Strings, Destructuring, Default Parameters, Rest/Spread operators, `let` and `const` declarations, Exponentiation Operator, Iterators, Generators, and Modules.
+- Do not use TC39 (Technical Committee 39) proposals that have not yet reached Stage 3 (Candidate) in the standardization process.
+
+##(29) Standard Library
+- Use `Number.isNaN()` instead of the global `isNaN()`.
+- Use `Number.isFinite()` instead of the global `isFinite()`.
+
+##(30) Testing
+- Always write tests for your code.
+- Strive to write many small, pure functions.
+- Exercise caution when using stubs and mocks in your tests.
+- Aim for 100% test coverage as a goal.
+- Whenever a bug is fixed, write a regression test specifically for that bug.
