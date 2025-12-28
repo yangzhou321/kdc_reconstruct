@@ -25,6 +25,11 @@ Rosbag转换性能测试脚本（流式方式）
 注意：
     本脚本使用流式方式读取rosbag，避免一次性加载所有数据到内存。
     适用于大文件（>5GB）的性能测试。
+    
+内存管理策略（参照内存管理实现详解.md）：
+    - 显式内存释放：使用del立即释放不需要的变量
+    - 流式处理：逐帧处理，不一次性加载
+    - 线程池限制：避免过度订阅
 """
 
 import os
@@ -62,6 +67,22 @@ except ImportError:
     print("Warning: psutil not installed. Memory monitoring disabled.")
     print("Install with: pip install psutil")
 
+# 线程池限制（参照内存管理实现详解.md：避免过度订阅）
+try:
+    from threadpoolctl import threadpool_limits
+    import cv2
+    # 限制OpenCV线程数
+    cv2.setNumThreads(1)
+    # 限制BLAS/MKL线程数（在需要时使用）
+    THREADPOOL_AVAILABLE = True
+except ImportError:
+    THREADPOOL_AVAILABLE = False
+    print("Warning: threadpoolctl not available. Thread pool limiting disabled.")
+    print("Install with: pip install threadpoolctl")
+except Exception as e:
+    THREADPOOL_AVAILABLE = False
+    print(f"Warning: Failed to set thread limits: {e}")
+
 
 @dataclass
 class PerformanceMetrics:
@@ -83,22 +104,43 @@ class PerformanceMetrics:
 
 
 class MemoryMonitor:
-    """内存监控器"""
+    """
+    内存监控器
+    
+    注意：Python 的内存分配器可能不会立即将内存返回给操作系统。
+    因此，如果之前的测试已经分配了大量内存，后续测试的 'initial' 基线
+    可能会很高。'get_increase()' 返回的是相对于当前测试开始时的内存增量，
+    这比 'get_peak()' 更能准确反映当前测试方法的内存占用。
+    """
     
     def __init__(self):
+        """
+        初始化内存监控器
+        
+        记录当前进程的内存使用量作为基线（initial）。
+        注意：如果之前的测试已经分配了大量内存，这个基线可能会很高。
+        """
         self.process = psutil.Process(os.getpid()) if HAS_PSUTIL else None
         self.samples = []
         self.peak = 0.0
         self.initial = self.get_current_memory()
     
     def get_current_memory(self) -> float:
-        """获取当前内存使用(MB)"""
+        """
+        获取当前内存使用(MB)
+        
+        使用 psutil 获取进程的 RSS (Resident Set Size)，即实际占用的物理内存。
+        """
         if self.process:
             return self.process.memory_info().rss / 1024 / 1024
         return 0.0
     
     def sample(self):
-        """采样当前内存"""
+        """
+        采样当前内存
+        
+        记录当前内存使用量，并更新峰值。
+        """
         mem = self.get_current_memory()
         self.samples.append(mem)
         if mem > self.peak:
@@ -106,9 +148,21 @@ class MemoryMonitor:
         return mem
     
     def get_peak(self) -> float:
+        """
+        获取峰值内存
+        
+        返回测试期间记录的最高内存使用量。
+        注意：这包括之前测试分配的内存（如果 Python 没有释放）。
+        """
         return self.peak
     
     def get_increase(self) -> float:
+        """
+        获取内存增量
+        
+        返回相对于测试开始时的内存增量。
+        这个值更能准确反映当前测试方法的内存占用。
+        """
         return self.peak - self.initial
 
 
@@ -294,12 +348,31 @@ def test_chunked_method(bag_file: str, output_dir: str, chunk_size: int = 100) -
     2. 第二遍扫描：按时间窗口分块读取+对齐+处理
     """
     metrics = PerformanceMetrics(method_name=f"Chunked Streaming (chunk={chunk_size})")
+    
+    # 在开始测试前，尝试强制释放内存（虽然可能无效，因为Python内存分配器会保留内存）
+    # 多次垃圾回收，尝试释放之前测试的内存
+    for _ in range(3):
+        gc.collect(2)
+    
+    # 等待一小段时间，让系统有机会回收内存（虽然通常无效）
+    time.sleep(0.1)
+    
     monitor = MemoryMonitor()
     metrics.initial_memory_mb = monitor.initial
     
     print("\n" + "="*60)
     print(f"Testing: Chunked Streaming Method (chunk_size={chunk_size})")
     print("="*60)
+    
+    # 如果初始内存很高，说明之前测试分配的内存还在
+    # 注意：由于测试顺序已改为流式方法先运行，正常情况下初始内存应该不会很高
+    if monitor.initial > 10000:  # 如果初始内存 > 10GB
+        print(f"\n⚠️  Warning: Initial memory is {monitor.initial:.2f} MB ({monitor.initial/1024:.2f} GB).")
+        print("   This may be due to:")
+        print("   1. Memory retained from previous test runs in the same session")
+        print("   2. Python's memory allocator (pymalloc) retaining memory")
+        print("   Focus on 'Memory Increase' and '+X MB from start' rather than 'Peak Memory'.")
+        print("="*60)
     
     try:
         import kuavo_data.common.kuavo_dataset as kuavo
@@ -319,21 +392,61 @@ def test_chunked_method(bag_file: str, output_dir: str, chunk_size: int = 100) -
         # 统计帧数
         frame_count = [0]
         chunk_count = [0]
+        prev_chunk_memory = [None]  # 记录上一个chunk的内存
         
         def on_frame(aligned_frame: dict, frame_idx: int):
-            """处理对齐后的帧"""
+            """
+            处理对齐后的帧（边处理边清理）
+            
+            参照内存管理实现详解.md：
+            - 立即处理数据，不要保留对aligned_frame的引用
+            - 处理完后立即释放（在process_in_chunks中完成）
+            
+            注意：这个回调只用于统计和监控，不实际存储数据
+            """
             frame_count[0] += 1
+            
+            # 定期采样内存（用于监控）
             if frame_count[0] % 100 == 0:
                 monitor.sample()
             if frame_count[0] % 1000 == 0:
                 print(f"    Processed {frame_count[0]} frames...")
+            
+            # 注意：这里不删除aligned_frame，因为：
+            # 1. 删除工作已经在process_in_chunks中完成
+            # 2. 这个回调只用于统计，不保留引用
+            # 3. 确保回调函数本身不会保留引用（使用局部变量）
         
-        def on_chunk_done():
-            """每个chunk处理完后的回调"""
+        def on_chunk_done(collected_objects=0):
+            """
+            每个chunk处理完后的回调（监控内存使用）
+            
+            注意：清理工作已经在process_in_chunks中完成（使用del机制），这里只是监控和报告
+            
+            Args:
+                collected_objects: 已废弃，现在总是0（因为不再使用gc.collect()）
+            """
             chunk_count[0] += 1
+            
+            # 记录当前内存（清理后）
+            mem_current = monitor.get_current_memory()
             mem = monitor.sample()
-            print(f"  Chunk {chunk_count[0]} done, memory: {mem:.2f} MB")
-            gc.collect()
+            
+            # 计算与上一个chunk的内存变化
+            if prev_chunk_memory[0] is not None:
+                mem_change = mem_current - prev_chunk_memory[0]
+                # 计算相对于测试开始时的内存增量
+                mem_from_start = mem_current - monitor.initial
+                if mem_change < 0:
+                    print(f"  Chunk {chunk_count[0]} done, memory: {mem:.2f} MB (freed {abs(mem_change):.2f} MB from prev chunk, +{mem_from_start:.2f} MB from start, using del mechanism)")
+                else:
+                    print(f"  Chunk {chunk_count[0]} done, memory: {mem:.2f} MB (change: {mem_change:+.2f} MB from prev chunk, +{mem_from_start:.2f} MB from start, using del mechanism)")
+            else:
+                mem_from_start = mem_current - monitor.initial
+                print(f"  Chunk {chunk_count[0]} done, memory: {mem:.2f} MB (+{mem_from_start:.2f} MB from start, using del mechanism)")
+            
+            # 更新上一个chunk的内存
+            prev_chunk_memory[0] = mem_current
         
         # 使用分块流式方法
         scan_end = time.time()
@@ -374,8 +487,13 @@ def test_chunked_method(bag_file: str, output_dir: str, chunk_size: int = 100) -
         print(f"✓ Completed: {metrics.num_frames} frames in {metrics.total_time_sec:.2f}s")
         print(f"  Scan time: {metrics.scan_time_sec:.2f}s")
         print(f"  Process time: {metrics.process_time_sec:.2f}s")
-        print(f"  Peak memory: {metrics.peak_memory_mb:.2f} MB")
-        print(f"  Memory increase: {metrics.memory_increase_mb:.2f} MB")
+        print(f"  Peak memory: {metrics.peak_memory_mb:.2f} MB ({metrics.peak_memory_mb/1024:.2f} GB)")
+        print(f"  Memory increase: {metrics.memory_increase_mb:.2f} MB ({metrics.memory_increase_mb/1024:.2f} GB)")
+        
+        # 如果Peak Memory很高但Memory Increase很小，说明内存是之前测试保留的
+        if metrics.peak_memory_mb > 10000 and metrics.memory_increase_mb < 1000:
+            print(f"  ℹ️  Note: High 'Peak Memory' ({metrics.peak_memory_mb/1024:.2f} GB) is due to memory retained from previous tests.")
+            print(f"      'Memory Increase' ({metrics.memory_increase_mb:.2f} MB) is the actual memory used by this method.")
         
     except Exception as e:
         metrics.success = False
@@ -475,6 +593,11 @@ def print_comparison_table(results: List[PerformanceMetrics]):
     """打印对比表格"""
     print("\n" + "="*80)
     print("PERFORMANCE COMPARISON")
+    print("="*80)
+    print("Note: 'Peak Mem' = process peak memory (includes previous allocations).")
+    print("      'Mem Inc' = memory increase during this test (more accurate).")
+    print("      Python may retain memory from previous tests, so 'Peak Mem' can be")
+    print("      higher than expected. 'Mem Inc' reflects the actual memory used.")
     print("="*80)
     
     # 表头
@@ -796,6 +919,11 @@ def main():
         print(f"System memory: {psutil.virtual_memory().total / 1024**3:.1f} GB")
         print(f"Available memory: {psutil.virtual_memory().available / 1024**3:.1f} GB")
     print("="*80)
+    if args.test_original:
+        print("\nℹ️  NOTE: Testing order: Streaming methods first, then Original method.")
+        print("   This ensures streaming methods show accurate memory usage.")
+        print("   Original method will be tested last (may allocate ~34GB memory).")
+        print("="*80)
     
     # 创建临时输出目录
     if args.output_dir:
@@ -808,20 +936,21 @@ def main():
     
     results = []
     
-    # 1. 测试时间戳扫描（验证第一遍扫描的效率）
+    # 1. 测试时间戳扫描（验证第一遍扫描的效率，内存占用极小）
     results.append(test_timestamp_scan_only(bag_file))
     
-    # 2. 测试原始方法（可选，内存占用大）
-    if args.test_original:
-        results.append(test_original_method(bag_file, output_dir))
+    # 2. 测试流式方法（先运行，避免继承原始方法的高内存占用）
+    #    2.1 测试不同chunk大小的分块流式方法（推荐，内存占用小）
+    for chunk_size in args.chunk_sizes:
+        results.append(test_chunked_method(bag_file, output_dir, chunk_size))
     
-    # 3. 测试流式方法（可选）
+    #    2.2 测试流式方法（可选）
     if args.test_streaming:
         results.append(test_streaming_method(bag_file, output_dir))
     
-    # 4. 测试不同chunk大小的分块流式方法（推荐）
-    for chunk_size in args.chunk_sizes:
-        results.append(test_chunked_method(bag_file, output_dir, chunk_size))
+    # 3. 测试原始方法（最后运行，内存占用大，避免影响流式方法的内存测量）
+    if args.test_original:
+        results.append(test_original_method(bag_file, output_dir))
     
     # 打印对比表格
     print_comparison_table(results)

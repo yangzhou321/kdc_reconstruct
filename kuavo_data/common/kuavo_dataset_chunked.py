@@ -1,9 +1,15 @@
 """
 分块流式处理rosbag模块
 
-核心思路（参考Diffusion Policy的按需读取方式）：
+核心思路（参考Diffusion Policy的按需读取方式和内存管理策略）：
 1. 第一遍扫描：只读取时间戳，确定主时间线（不加载图像数据，内存占用极小）
 2. 第二遍扫描：按时间窗口分块读取，边读取边对齐边写入dataset
+
+内存管理策略（参照内存管理实现详解.md）：
+- 显式内存释放：使用del立即释放不需要的变量
+- 流式处理：逐帧处理，不一次性加载
+- 及时释放中间变量：在循环中及时释放
+- 线程池限制：避免过度订阅
 
 与原始方法的区别：
 - 原始：一次性加载所有数据到内存 → 对齐 → 写入dataset（内存峰值巨大）
@@ -16,8 +22,24 @@ from collections import defaultdict
 from typing import Dict, List, Callable, Optional, Tuple, Generator
 import logging
 import bisect
+import gc
 
 logger = logging.getLogger(__name__)
+
+# 尝试导入线程池限制工具（如果可用）
+try:
+    from threadpoolctl import threadpool_limits
+    THREADPOOL_AVAILABLE = True
+except ImportError:
+    THREADPOOL_AVAILABLE = False
+    logger.warning("threadpoolctl not available, thread pool limiting disabled")
+
+# 尝试导入OpenCV线程限制（如果可用）
+try:
+    import cv2
+    cv2.setNumThreads(1)  # 限制OpenCV线程数
+except ImportError:
+    pass
 
 
 class ChunkedRosbagProcessor:
@@ -104,7 +126,7 @@ class ChunkedRosbagProcessor:
         all_timestamps: Dict[str, List[float]],
         frame_callback: Callable[[dict, int], None],
         chunk_size: int = 100,
-        save_callback: Optional[Callable[[], None]] = None
+        save_callback: Optional[Callable[[int], None]] = None
     ) -> int:
         """
         第二遍扫描：按时间窗口分块处理
@@ -164,30 +186,142 @@ class ChunkedRosbagProcessor:
             # 读取该时间范围内的消息
             chunk_data = self._read_chunk_data(bag, chunk_start_time, chunk_end_time)
             
-            # 对齐并处理每帧
+            # 对齐并处理每帧（边读取边对齐边处理，处理完立即删除）
+            # 参照内存管理实现详解.md：显式释放策略
             for local_idx, (global_idx, main_stamp) in enumerate(
                 zip(range(start_idx, end_idx), chunk_timestamps)
             ):
-                aligned_frame = self._align_single_frame(
-                    main_stamp=main_stamp,
-                    global_idx=global_idx,
-                    chunk_data=chunk_data,
-                    timestamp_arrays=timestamp_arrays,
-                    alignment_indices=alignment_indices,
-                    arm_traj_gaps=arm_traj_gaps
-                )
+                # 限制线程池大小（避免过度订阅，参照文档策略）
+                if THREADPOOL_AVAILABLE:
+                    with threadpool_limits(limits=1, user_api='blas'):
+                        aligned_frame = self._align_single_frame(
+                            main_stamp=main_stamp,
+                            global_idx=global_idx,
+                            chunk_data=chunk_data,
+                            timestamp_arrays=timestamp_arrays,
+                            alignment_indices=alignment_indices,
+                            arm_traj_gaps=arm_traj_gaps
+                        )
+                else:
+                    aligned_frame = self._align_single_frame(
+                        main_stamp=main_stamp,
+                        global_idx=global_idx,
+                        chunk_data=chunk_data,
+                        timestamp_arrays=timestamp_arrays,
+                        alignment_indices=alignment_indices,
+                        arm_traj_gaps=arm_traj_gaps
+                    )
                 
+                # 立即调用回调处理（不存储，假设回调会立即处理数据）
                 frame_callback(aligned_frame, global_idx)
                 total_frames += 1
+                
+                # 立即清理对齐后的帧数据（释放引用）
+                # 参照文档：在数据加载时释放（del data[key]）
+                # 先清理帧中的大对象（图像数组），确保彻底释放
+                if isinstance(aligned_frame, dict):
+                    for k in list(aligned_frame.keys()):
+                        v = aligned_frame[k]
+                        if isinstance(v, dict):
+                            # 如果是字典，检查是否有numpy数组
+                            if "data" in v and isinstance(v["data"], np.ndarray):
+                                # 显式删除numpy数组（参照文档：del data[key]）
+                                arr = v["data"]
+                                del v["data"]
+                                # 尝试释放numpy数组的底层内存
+                                if hasattr(arr, 'base') and arr.base is not None:
+                                    del arr.base
+                                del arr
+                            # 删除整个字典值
+                            del aligned_frame[k]
+                        elif isinstance(v, np.ndarray):
+                            # 如果是直接的numpy数组，直接删除
+                            arr = v
+                            del aligned_frame[k]
+                            if hasattr(arr, 'base') and arr.base is not None:
+                                del arr.base
+                            del arr
+                        else:
+                            # 其他类型，直接删除
+                            del aligned_frame[k]
+                # 删除整个aligned_frame字典
+                del aligned_frame
+                
+                # 注意：不再调用gc.collect()，完全依赖del机制
+                # Python的引用计数会在del时立即删除对象（如果没有循环引用）
+                # 如果有循环引用，会在下次自动GC时回收，不需要手动调用
             
-            # 释放chunk数据
+            # 彻底释放chunk数据（包含所有图像和消息数据）
+            # 参照文档：在训练循环中释放（del batch, del obs_dict等）
+            # 策略：先删除所有numpy数组，再删除字典结构
+            chunk_keys = list(chunk_data.keys())
+            for key in chunk_keys:
+                if key not in chunk_data:
+                    continue
+                ts_dict = chunk_data[key]
+                ts_keys = list(ts_dict.keys())
+                for timestamp in ts_keys:
+                    if timestamp not in ts_dict:
+                        continue
+                    msg_data = ts_dict[timestamp]
+                    
+                    # 删除图像数组等大对象
+                    if isinstance(msg_data, dict):
+                        # 如果是字典，先删除其中的numpy数组
+                        if "data" in msg_data and isinstance(msg_data["data"], np.ndarray):
+                            arr = msg_data["data"]
+                            del msg_data["data"]
+                            # 尝试释放numpy数组的底层内存
+                            if hasattr(arr, 'base') and arr.base is not None:
+                                del arr.base
+                            del arr
+                        # 删除整个消息数据字典
+                        del msg_data
+                    elif isinstance(msg_data, np.ndarray):
+                        # 如果是直接的numpy数组，直接删除
+                        arr = msg_data
+                        if hasattr(arr, 'base') and arr.base is not None:
+                            del arr.base
+                        del arr
+                    
+                    # 从字典中删除该时间戳的条目
+                    del ts_dict[timestamp]
+                
+                # 删除该key的整个字典
+                del chunk_data[key]
+            
+            # 清空并删除整个chunk_data字典
+            chunk_data.clear()
             del chunk_data
             
-            # 调用保存回调
+            # 清理临时变量（避免保留引用）
+            del chunk_keys
+            del ts_dict
+            del ts_keys
+            
+            # 注意：完全依赖del机制删除对象，不再调用gc.collect()
+            # 
+            # Python的引用计数机制：
+            # - 当对象的引用计数降为0时，立即被删除（不需要gc.collect()）
+            # - 如果对象有循环引用，会在Python的自动GC时回收（通常很快）
+            # - del语句会立即减少引用计数，对象会被立即删除
+            #
+            # 优势：
+            # - 更快的删除速度（不需要等待GC扫描）
+            # - 更可预测的行为（del后立即删除）
+            # - 减少GC开销（让Python自动管理GC）
+            #
+            # 验证删除是否生效：
+            # - 查看内存变化（+X MB from start）
+            # - 查看是否有"freed X MB"的提示
+            # - 如果内存稳定或下降，说明删除生效
+            
+            # 调用保存回调（不再传递collected数量，因为不再调用gc.collect()）
             if save_callback:
-                save_callback()
+                # 传递0表示完全依赖del机制（不依赖gc.collect()）
+                save_callback(0)
                 logger.info(f"Chunk {chunk_idx+1}/{num_chunks} processed and saved. "
-                           f"Frames: {start_idx}-{end_idx-1}")
+                           f"Frames: {start_idx}-{end_idx-1} (using del mechanism, no gc.collect())")
         
         bag.close()
         logger.info(f"Total frames processed: {total_frames}")
@@ -245,7 +379,9 @@ class ChunkedRosbagProcessor:
     
     def _read_chunk_data(self, bag: rosbag.Bag, start_time: float, end_time: float) -> Dict[str, Dict[float, dict]]:
         """
-        读取指定时间范围内的消息数据
+        读取指定时间范围内的消息数据（边读取边处理，不保留原始消息对象）
+        
+        参照文档：流式处理策略，逐帧处理，不一次性加载
         
         Returns:
             {topic_key: {timestamp: msg_data}}
@@ -254,34 +390,77 @@ class ChunkedRosbagProcessor:
         chunk_data = defaultdict(dict)
         topic_to_key = {v["topic"]: k for k, v in self._topic_process_map.items()}
         
-        # 使用时间范围过滤
-        try:
-            start_ros_time = rospy.Time.from_sec(start_time)
-            end_ros_time = rospy.Time.from_sec(end_time)
-            
-            for topic, msg, t in bag.read_messages(
-                topics=list(topic_to_key.keys()),
-                start_time=start_ros_time,
-                end_time=end_ros_time
-            ):
-                key = topic_to_key.get(topic)
-                if key:
-                    msg_process_fn = self._topic_process_map[key]["msg_process_fn"]
-                    msg_data = msg_process_fn(msg)
-                    msg_data["timestamp"] = t.to_sec()
-                    chunk_data[key][t.to_sec()] = msg_data
-        except Exception as e:
-            logger.warning(f"Time-range filtering failed: {e}, falling back to full scan")
-            # 回退到全量扫描+手动过滤
-            for topic, msg, t in bag.read_messages(topics=list(topic_to_key.keys())):
-                ts = t.to_sec()
-                if start_time <= ts <= end_time:
+        # 限制线程池大小（避免过度订阅）
+        if THREADPOOL_AVAILABLE:
+            with threadpool_limits(limits=1, user_api='blas'):
+                # 使用时间范围过滤
+                try:
+                    start_ros_time = rospy.Time.from_sec(start_time)
+                    end_ros_time = rospy.Time.from_sec(end_time)
+                    
+                    for topic, msg, t in bag.read_messages(
+                        topics=list(topic_to_key.keys()),
+                        start_time=start_ros_time,
+                        end_time=end_ros_time
+                    ):
+                        key = topic_to_key.get(topic)
+                        if key:
+                            msg_process_fn = self._topic_process_map[key]["msg_process_fn"]
+                            # 立即处理消息，转换为数据格式（释放原始msg对象）
+                            # 参照文档：立即处理，不保留原始对象
+                            msg_data = msg_process_fn(msg)
+                            msg_data["timestamp"] = t.to_sec()
+                            chunk_data[key][t.to_sec()] = msg_data
+                            # 立即删除原始消息对象（参照文档：del msg）
+                            del msg
+                except Exception as e:
+                    logger.warning(f"Time-range filtering failed: {e}, falling back to full scan")
+                    # 回退到全量扫描+手动过滤
+                    for topic, msg, t in bag.read_messages(topics=list(topic_to_key.keys())):
+                        ts = t.to_sec()
+                        if start_time <= ts <= end_time:
+                            key = topic_to_key.get(topic)
+                            if key:
+                                msg_process_fn = self._topic_process_map[key]["msg_process_fn"]
+                                # 立即处理消息，转换为数据格式
+                                msg_data = msg_process_fn(msg)
+                                msg_data["timestamp"] = ts
+                                chunk_data[key][ts] = msg_data
+                                # 立即删除原始消息对象
+                                del msg
+        else:
+            # 不使用线程池限制（如果threadpoolctl不可用）
+            try:
+                start_ros_time = rospy.Time.from_sec(start_time)
+                end_ros_time = rospy.Time.from_sec(end_time)
+                
+                for topic, msg, t in bag.read_messages(
+                    topics=list(topic_to_key.keys()),
+                    start_time=start_ros_time,
+                    end_time=end_ros_time
+                ):
                     key = topic_to_key.get(topic)
                     if key:
                         msg_process_fn = self._topic_process_map[key]["msg_process_fn"]
                         msg_data = msg_process_fn(msg)
-                        msg_data["timestamp"] = ts
-                        chunk_data[key][ts] = msg_data
+                        msg_data["timestamp"] = t.to_sec()
+                        chunk_data[key][t.to_sec()] = msg_data
+                        del msg
+            except Exception as e:
+                logger.warning(f"Time-range filtering failed: {e}, falling back to full scan")
+                for topic, msg, t in bag.read_messages(topics=list(topic_to_key.keys())):
+                    ts = t.to_sec()
+                    if start_time <= ts <= end_time:
+                        key = topic_to_key.get(topic)
+                        if key:
+                            msg_process_fn = self._topic_process_map[key]["msg_process_fn"]
+                            msg_data = msg_process_fn(msg)
+                            msg_data["timestamp"] = ts
+                            chunk_data[key][ts] = msg_data
+                            del msg
+        
+        # 清理临时变量（参照文档：及时释放中间变量）
+        del topic_to_key
         
         return dict(chunk_data)
     
@@ -295,7 +474,10 @@ class ChunkedRosbagProcessor:
         arm_traj_gaps: List[Tuple[float, float]]
     ) -> dict:
         """
-        对齐单帧数据
+        对齐单帧数据（创建数据副本，避免保留对chunk_data的引用）
+        
+        注意：为了确保内存能够被释放，这里会创建数据的副本。
+        对于numpy数组，使用.copy()；对于字典，使用浅拷贝。
         """
         aligned_frame = {"timestamp": main_stamp}
         
@@ -329,15 +511,55 @@ class ChunkedRosbagProcessor:
             
             target_ts = timestamp_arrays[key][closest_idx]
             
-            # 从chunk_data中查找数据
+            # 从chunk_data中查找数据（创建副本，避免保留引用）
             if key in chunk_data:
-                # 查找最接近target_ts的数据
-                ts_list = list(chunk_data[key].keys())
-                if ts_list:
-                    closest_chunk_ts = min(ts_list, key=lambda x: abs(x - target_ts))
-                    aligned_frame[key] = chunk_data[key][closest_chunk_ts]
+                chunk_key_data = chunk_data[key]
+                if chunk_key_data:
+                    # 查找最接近target_ts的数据（避免创建临时列表）
+                    closest_chunk_ts = None
+                    min_diff = float('inf')
+                    for ts in chunk_key_data.keys():
+                        diff = abs(ts - target_ts)
+                        if diff < min_diff:
+                            min_diff = diff
+                            closest_chunk_ts = ts
+                        # 清理循环中的临时变量
+                        del diff
+                    # 清理临时变量
+                    del min_diff
+                    
+                    if closest_chunk_ts is not None:
+                        source_data = chunk_key_data[closest_chunk_ts]
+                        
+                        # 创建数据副本（避免保留对chunk_data的引用）
+                        if source_data is None:
+                            aligned_frame[key] = None
+                        elif isinstance(source_data, dict):
+                            # 对于字典，创建浅拷贝，但对其中的numpy数组创建副本
+                            aligned_frame[key] = {}
+                            for k, v in source_data.items():
+                                if isinstance(v, np.ndarray):
+                                    aligned_frame[key][k] = v.copy()
+                                else:
+                                    aligned_frame[key][k] = v
+                        elif isinstance(source_data, np.ndarray):
+                            aligned_frame[key] = source_data.copy()
+                        else:
+                            # 其他类型，直接赋值（通常是标量）
+                            aligned_frame[key] = source_data
+                        
+                        # 清理临时变量
+                        del source_data
+                    else:
+                        aligned_frame[key] = None
+                    
+                    # 清理临时变量
+                    del closest_chunk_ts
                 else:
                     aligned_frame[key] = None
+                
+                # 清理临时变量
+                del chunk_key_data
             else:
                 aligned_frame[key] = None
         
